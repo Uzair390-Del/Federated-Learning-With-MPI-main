@@ -8,7 +8,6 @@ from tensorflow.keras.utils import to_categorical
 import socket
 import os
 import struct
-
 # Use localhost for single-PC testing
 SERVER_HOST = '127.0.0.1'  
 SERVER_PORT = 5001
