@@ -1,79 +1,103 @@
+import numpy as np
 import socket
 import pickle
-import numpy as np
-from sklearn.linear_model import LogisticRegression
-from torchvision import datasets, transforms
+import struct
+from sklearn.datasets import fetch_openml
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import SGDClassifier
+from sklearn.metrics import accuracy_score, confusion_matrix, classification_report
 import matplotlib.pyplot as plt
+import seaborn as sns
 
-# --- Federated Averaging ---
-def federated_average(weights_list, biases_list, sample_sizes):
-    total_samples = sum(sample_sizes)
-    avg_weights = np.sum([w * n for w, n in zip(weights_list, sample_sizes)], axis=0) / total_samples
-    avg_bias = np.sum([b * n for b, n in zip(biases_list, sample_sizes)], axis=0) / total_samples
-    return avg_weights, avg_bias
+# --- Configuration ---
+SERVER_HOST = '0.0.0.0'
+SERVER_PORT = 6465
 
-# --- Socket Setup ---
-HOST = '0.0.0.0'  # Listen on all network interfaces
-PORT = 65432
+# --- Data Preparation (Server only loads test data) ---
+X_full, y_full = fetch_openml('mnist_784', version=1, return_X_y=True, as_frame=False)
+X_test = X_full[60000:] / 255.0
+y_test = y_full[60000:].astype(int)
 
-# Load test data for evaluation
-# transform = transforms.Compose([transforms.ToTensor(), transforms.Normalize((0.5,), (0.5,))])
-# mnist_test = datasets.MNIST(root='./data', train=False, transform=transform)
-# Load test data for evaluation (ADD download=True)
-transform = transforms.Compose([transforms.ToTensor(), transforms.Normalize((0.5,), (0.5,))])
-mnist_test = datasets.MNIST(root='./data', train=False, download=True, transform=transform)  # Fix: Added download=True
-X_test = mnist_test.data.numpy().reshape(-1, 784) / 255.0
-y_test = mnist_test.targets.numpy()
+# --- Aggregation Logic ---
+def aggregate_params(params_list):
+    if not params_list or len(params_list) != 2:
+        return None
+    
+    # Federated averaging for coefficients and intercepts
+    agg_coef = (params_list[0]['coef_'] + params_list[1]['coef_']) / 2
+    agg_intercept = (params_list[0]['intercept_'] + params_list[1]['intercept_']) / 2
+    
+    return {'coef_': agg_coef, 'intercept_': agg_intercept}
 
-# Initialize global model
-global_model = LogisticRegression(max_iter=1, warm_start=True, solver='saga')
-global_model.coef_ = np.zeros((10, 784))  # 10 classes, 784 features
-global_model.intercept_ = np.zeros(10)
-
-# Track accuracy over rounds
-accuracies = []
-
-with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-    s.bind((HOST, PORT))
-    s.listen()
-    print(f"Server listening on {HOST}:{PORT}")
-
-    for round in range(5):  # 5 communication rounds
-        print(f"\n=== Round {round + 1} ===")
+# --- Socket Communication ---
+def receive_model_params(conn):
+    try:
+        data_size_bytes = conn.recv(4)
+        if not data_size_bytes:
+            return None
+        data_size = struct.unpack('!I', data_size_bytes)[0]
         
-        # Collect weights from clients
-        client_weights = []
-        client_biases = []
-        sample_sizes = []
+        data = b''
+        while len(data) < data_size:
+            packet = conn.recv(4096)
+            if not packet:
+                return None
+            data += packet
+        
+        params = pickle.loads(data)
+        return params
+    
+    except Exception as e:
+        print(f"Error during parameter reception: {e}")
+        return None
 
-        for _ in range(2):  # Expect 2 clients
-            conn, addr = s.accept()
-            print(f"Connected by {addr}")
+# --- Main Server Logic ---
+def main():
+    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_socket.bind((SERVER_HOST, SERVER_PORT))
+    server_socket.listen(2)
+    print(f"Server listening on {SERVER_HOST}:{SERVER_PORT}")
+    
+    client_params = []
+    
+    for i in range(2):
+        conn, addr = server_socket.accept()
+        print(f"Connection from {addr} has been established!")
+        params = receive_model_params(conn)
+        if params:
+            client_params.append(params)
+            print(f"Parameters from client {i+1} received successfully!")
+        conn.close()
 
-            data = conn.recv(4096 * 16)  # Large buffer for weights
-            weights, bias, n_samples = pickle.loads(data)
-            client_weights.append(weights)
-            client_biases.append(bias)
-            sample_sizes.append(n_samples)
+    print("\nAll client parameters received. Starting aggregation...")
 
-            # Send current global model to client
-            conn.sendall(pickle.dumps((global_model.coef_, global_model.intercept_)))
-            conn.close()
+    if len(client_params) == 2:
+        aggregated_params = aggregate_params(client_params)
+        
+        # Create a new model instance and set the aggregated parameters
+        final_model = SGDClassifier(loss='log_loss', max_iter=1, warm_start=True)
+        # Note: We need to fit once to initialize the model before setting weights
+        final_model.fit(X_test[:10], y_test[:10]) 
+        final_model.coef_ = aggregated_params['coef_']
+        final_model.intercept_ = aggregated_params['intercept_']
+        final_model.classes_ = np.array([0, 1, 2, 3, 4, 5, 6, 7, 8, 9])
+        
+        y_pred = final_model.predict(X_test)
+        accuracy = accuracy_score(y_test, y_pred)
+        print(f'\nAggregated Model Final Accuracy: {accuracy:.4f}')
 
-        # Aggregate weights
-        global_weights, global_bias = federated_average(client_weights, client_biases, sample_sizes)
-        global_model.coef_ = global_weights
-        global_model.intercept_ = global_bias
+        # --- Plotting ---
+        conf_matrix = confusion_matrix(y_test, y_pred)
+        report = classification_report(y_test, y_pred, output_dict=True)
+        
+        plt.figure(figsize=(10, 8))
+        sns.heatmap(conf_matrix, annot=True, fmt='d', cmap='Blues')
+        plt.title('Confusion Matrix')
+        plt.ylabel('True label')
+        plt.xlabel('Predicted label')
+        plt.show()
 
-        # Evaluate
-        accuracy = global_model.score(X_test, y_test)
-        accuracies.append(accuracy)
-        print(f"Global Accuracy: {accuracy * 100:.2f}%")
+    server_socket.close()
 
-# Plot results
-plt.plot(range(1, 6), accuracies, marker='o')
-plt.xlabel("Communication Round")
-plt.ylabel("Accuracy")
-plt.title("Federated Learning Performance")
-plt.grid()
-plt.show()
+if __name__ == "__main__":
+    main()
